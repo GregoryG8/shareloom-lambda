@@ -1,0 +1,12 @@
+# Binarios y paquetes de despliegue de AWS
+bootstrap
+*.zip
+
+# Variables de entorno o credenciales locales
+.env
+*.pem
+
+# Configuraciones de editores/IDE
+.vscode/
+.idea/
+*.swp
