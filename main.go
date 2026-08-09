@@ -54,10 +54,16 @@ type ErrorResponseBody struct {
 	Error string `json:"error"`
 }
 
+// MessageResponseBody defines a generic message response
+type MessageResponseBody struct {
+	Message string `json:"message"`
+}
+
 // Handler is the entry point for the Lambda function.
-// It inspects req.PathParameters["fileId"] to determine the flow:
-//   - If fileId EXISTS  → Download flow (Burn After Reading)
-//   - If fileId is ABSENT → Upload flow
+// It inspects req.HTTPMethod and req.PathParameters["fileId"] to determine the flow:
+//   - DELETE + fileId  → Delete file from S3
+//   - fileId EXISTS    → Download flow (Burn After Reading)
+//   - fileId ABSENT    → Upload flow
 func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	bucketName := os.Getenv("BUCKET_NAME")
 	if bucketName == "" {
@@ -65,8 +71,13 @@ func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 		return createErrorResponse("Internal server error configuration", 500), nil
 	}
 
-	// Determine flow based on the presence of fileId path parameter
+	// Determine flow based on HTTP method and the presence of fileId path parameter
 	fileID := req.PathParameters["fileId"]
+
+	if req.HTTPMethod == "DELETE" && fileID != "" {
+		// --- Delete Flow (DELETE /file/{fileId}) ---
+		return handleDeleteFile(ctx, fileID, bucketName)
+	}
 
 	if fileID != "" {
 		// --- Download Flow (GET /download/{fileId}) - Burn After Reading ---
@@ -136,10 +147,25 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayProx
 }
 
 // handleDownload implements the Burn After Reading pattern:
-// 1. Generates a presigned GET URL with 2-minute expiration
-// 2. Deletes the DynamoDB record immediately
+// 1. Attempts a conditional DeleteItem (attribute_exists(fileId)) to atomically verify and destroy the record
+// 2. If the delete fails (record doesn't exist), returns 404
+// 3. Only on successful delete, generates a presigned GET URL with 2-minute expiration
 func handleDownload(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
-	// Generate a presigned GET URL with 2-minute expiration
+	// Attempt conditional delete — this atomically checks existence and removes the record
+	_, err := dynamodbClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"fileId": &types.AttributeValueMemberS{Value: fileID},
+		},
+		ConditionExpression: aws.String("attribute_exists(fileId)"),
+	})
+	if err != nil {
+		// ConditionalCheckFailedException means the item didn't exist (already burned or expired)
+		log.Printf("DeleteItem failed for fileId %s: %v", fileID, err)
+		return createErrorResponse("El enlace ha caducado o ya fue utilizado", 404), nil
+	}
+
+	// Record successfully deleted — generate a presigned GET URL with 2-minute expiration
 	presignReq, err := s3PresignClient.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(fileID),
@@ -151,21 +177,42 @@ func handleDownload(ctx context.Context, fileID string, bucketName string) (even
 		return createErrorResponse("Failed to generate download URL", 500), nil
 	}
 
-	// Delete the record from DynamoDB immediately (Burn After Reading)
-	_, err = dynamodbClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: aws.String(tableName),
-		Key: map[string]types.AttributeValue{
-			"fileId": &types.AttributeValueMemberS{Value: fileID},
-		},
-	})
-	if err != nil {
-		log.Printf("Failed to delete item from DynamoDB: %v", err)
-		return createErrorResponse("Failed to process download", 500), nil
-	}
-
 	// Return the download URL
 	resBody := DownloadResponseBody{
 		DownloadURL: presignReq.URL,
+	}
+
+	bodyBytes, err := json.Marshal(resBody)
+	if err != nil {
+		log.Printf("Failed to marshal response body: %v", err)
+		return createErrorResponse("Failed to encode response", 500), nil
+	}
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: 200,
+		Headers: map[string]string{
+			"Access-Control-Allow-Origin": "*",
+			"Content-Type":                "application/json",
+		},
+		Body: string(bodyBytes),
+	}, nil
+}
+
+// handleDeleteFile physically deletes the S3 object
+func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
+	// Delete the object from S3
+	_, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(fileID),
+	})
+	if err != nil {
+		log.Printf("Failed to delete object from S3: %v", err)
+		return createErrorResponse(fmt.Sprintf("Failed to delete file: %v", err), 500), nil
+	}
+
+	// Return success message
+	resBody := MessageResponseBody{
+		Message: "Archivo eliminado de S3",
 	}
 
 	bodyBytes, err := json.Marshal(resBody)
