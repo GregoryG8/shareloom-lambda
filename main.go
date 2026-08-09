@@ -60,10 +60,11 @@ type MessageResponseBody struct {
 }
 
 // Handler is the entry point for the Lambda function.
+// Compatible with API Gateway v1 and v2 payloads.
 // Routes based on the HTTP method:
-//   - DELETE → Delete file physically from S3
-//   - GET    → Download flow (Burn After Reading)
 //   - POST   → Upload flow
+//   - GET    → Download flow (Burn After Reading)
+//   - DELETE → Delete file physically from S3
 func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	bucketName := os.Getenv("BUCKET_NAME")
 	if bucketName == "" {
@@ -71,13 +72,22 @@ func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 		return createErrorResponse("Internal server error configuration", 500), nil
 	}
 
-	switch req.HTTPMethod {
-	case "DELETE":
-		return handleDeleteFile(ctx, req, bucketName)
-	case "GET":
-		return handleDownload(ctx, req, bucketName)
-	case "POST":
+	// Detect HTTP method — compatible with API Gateway v1 and v2 payloads
+	method := req.HTTPMethod
+	if method == "" {
+		method = req.RequestContext.HTTPMethod
+	}
+
+	// Extract fileId path parameter
+	fileID, hasFileID := req.PathParameters["fileId"]
+
+	switch {
+	case method == "POST":
 		return handleUpload(ctx, bucketName)
+	case method == "GET" && hasFileID && fileID != "":
+		return handleDownload(ctx, fileID, bucketName)
+	case method == "DELETE" && hasFileID && fileID != "":
+		return handleDeleteFile(ctx, fileID, bucketName)
 	default:
 		return createErrorResponse("Method not allowed", 405), nil
 	}
@@ -145,12 +155,7 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayProx
 // 1. Attempts a conditional DeleteItem (attribute_exists(fileId)) to atomically verify and destroy the record
 // 2. If the delete fails (record doesn't exist), returns 404
 // 3. Only on successful delete, generates a presigned GET URL with 2-minute expiration
-func handleDownload(ctx context.Context, req events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
-	fileID := req.PathParameters["fileId"]
-	if fileID == "" {
-		return createErrorResponse("fileId is required", 400), nil
-	}
-
+func handleDownload(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
 	// Attempt conditional delete — this atomically checks existence and removes the record
 	_, err := dynamodbClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName),
@@ -199,12 +204,7 @@ func handleDownload(ctx context.Context, req events.APIGatewayProxyRequest, buck
 }
 
 // handleDeleteFile physically deletes the S3 object
-func handleDeleteFile(ctx context.Context, req events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
-	fileID := req.PathParameters["fileId"]
-	if fileID == "" {
-		return createErrorResponse("fileId is required", 400), nil
-	}
-
+func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
 	// Delete the object from S3
 	_, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(bucketName),
@@ -217,7 +217,7 @@ func handleDeleteFile(ctx context.Context, req events.APIGatewayProxyRequest, bu
 
 	// Return success message
 	resBody := MessageResponseBody{
-		Message: "Archivo eliminado de S3 físicamente",
+		Message: "Archivo eliminado de S3",
 	}
 
 	bodyBytes, err := json.Marshal(resBody)
