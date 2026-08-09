@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -39,8 +38,8 @@ func init() {
 	dynamodbClient = dynamodb.NewFromConfig(cfg)
 }
 
-// ResponseBody defines the successful JSON response structure for upload
-type ResponseBody struct {
+// UploadResponseBody defines the successful JSON response for upload
+type UploadResponseBody struct {
 	UploadURL string `json:"uploadUrl"`
 	FileID    string `json:"fileId"`
 }
@@ -50,17 +49,15 @@ type DownloadResponseBody struct {
 	DownloadURL string `json:"downloadUrl"`
 }
 
-// MessageResponseBody defines a generic message response
-type MessageResponseBody struct {
-	Message string `json:"message"`
-}
-
 // ErrorResponseBody defines the error JSON response structure
 type ErrorResponseBody struct {
 	Error string `json:"error"`
 }
 
-// Handler is the entry point for the Lambda function
+// Handler is the entry point for the Lambda function.
+// It inspects req.PathParameters["fileId"] to determine the flow:
+//   - If fileId EXISTS  → Download flow (Burn After Reading)
+//   - If fileId is ABSENT → Upload flow
 func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	bucketName := os.Getenv("BUCKET_NAME")
 	if bucketName == "" {
@@ -68,31 +65,30 @@ func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 		return createErrorResponse("Internal server error configuration", 500), nil
 	}
 
-	// Route based on HTTP method and path
-	path := req.Path
-	method := req.HTTPMethod
+	// Determine flow based on the presence of fileId path parameter
+	fileID := req.PathParameters["fileId"]
 
-	switch {
-	case method == "GET" && strings.HasPrefix(path, "/download/"):
-		return handleDownload(ctx, req, bucketName)
-	case method == "DELETE" && strings.HasPrefix(path, "/file/"):
-		return handleDeleteFile(ctx, req, bucketName)
-	default:
-		return handleUpload(ctx, req, bucketName)
+	if fileID != "" {
+		// --- Download Flow (GET /download/{fileId}) - Burn After Reading ---
+		return handleDownload(ctx, fileID, bucketName)
 	}
+
+	// --- Upload Flow (POST /upload) ---
+	return handleUpload(ctx, bucketName)
 }
 
-// handleUpload generates a presigned PUT URL and stores metadata in DynamoDB
-func handleUpload(ctx context.Context, req events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
+// handleUpload generates a presigned PUT URL and stores metadata in DynamoDB.
+// Uses UUID v4 as the fileId.
+func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayProxyResponse, error) {
 	now := time.Now()
 
-	// Generate a unique fileId using UUID
+	// Generate a unique fileId using UUID v4
 	fileID := uuid.New().String()
 
-	// Calculate a Unix timestamp expireAt for 24 hours in the future
+	// Calculate expireAt for 24 hours in the future
 	expireAt := now.Add(24 * time.Hour).Unix()
 
-	// Insert a record into Amazon DynamoDB
+	// Insert a record into DynamoDB
 	_, err := dynamodbClient.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(tableName),
 		Item: map[string]types.AttributeValue{
@@ -117,8 +113,8 @@ func handleUpload(ctx context.Context, req events.APIGatewayProxyRequest, bucket
 		return createErrorResponse(fmt.Sprintf("Failed to generate upload URL: %v", err), 500), nil
 	}
 
-	// Respond with a JSON containing uploadUrl and fileId
-	resBody := ResponseBody{
+	// Respond with uploadUrl and fileId
+	resBody := UploadResponseBody{
 		UploadURL: presignReq.URL,
 		FileID:    fileID,
 	}
@@ -140,32 +136,9 @@ func handleUpload(ctx context.Context, req events.APIGatewayProxyRequest, bucket
 }
 
 // handleDownload implements the Burn After Reading pattern:
-// 1. Checks if fileId exists in DynamoDB
-// 2. Generates a presigned GET URL (2 min expiry)
-// 3. Deletes the DynamoDB record immediately
-func handleDownload(ctx context.Context, req events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
-	fileID := req.PathParameters["fileId"]
-	if fileID == "" {
-		return createErrorResponse("fileId is required", 400), nil
-	}
-
-	// Check if the fileId exists in DynamoDB
-	getResult, err := dynamodbClient.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(tableName),
-		Key: map[string]types.AttributeValue{
-			"fileId": &types.AttributeValueMemberS{Value: fileID},
-		},
-	})
-	if err != nil {
-		log.Printf("Failed to get item from DynamoDB: %v", err)
-		return createErrorResponse("Internal server error", 500), nil
-	}
-
-	// If the item does not exist, return 404
-	if getResult.Item == nil {
-		return createErrorResponse("El archivo no existe o ya fue autodestruido", 404), nil
-	}
-
+// 1. Generates a presigned GET URL with 2-minute expiration
+// 2. Deletes the DynamoDB record immediately
+func handleDownload(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
 	// Generate a presigned GET URL with 2-minute expiration
 	presignReq, err := s3PresignClient.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
@@ -178,7 +151,7 @@ func handleDownload(ctx context.Context, req events.APIGatewayProxyRequest, buck
 		return createErrorResponse("Failed to generate download URL", 500), nil
 	}
 
-	// Delete the record from DynamoDB immediately (burn after reading)
+	// Delete the record from DynamoDB immediately (Burn After Reading)
 	_, err = dynamodbClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName),
 		Key: map[string]types.AttributeValue{
@@ -193,44 +166,6 @@ func handleDownload(ctx context.Context, req events.APIGatewayProxyRequest, buck
 	// Return the download URL
 	resBody := DownloadResponseBody{
 		DownloadURL: presignReq.URL,
-	}
-
-	bodyBytes, err := json.Marshal(resBody)
-	if err != nil {
-		log.Printf("Failed to marshal response body: %v", err)
-		return createErrorResponse("Failed to encode response", 500), nil
-	}
-
-	return events.APIGatewayProxyResponse{
-		StatusCode: 200,
-		Headers: map[string]string{
-			"Access-Control-Allow-Origin": "*",
-			"Content-Type":                "application/json",
-		},
-		Body: string(bodyBytes),
-	}, nil
-}
-
-// handleDeleteFile physically deletes the S3 object
-func handleDeleteFile(ctx context.Context, req events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
-	fileID := req.PathParameters["fileId"]
-	if fileID == "" {
-		return createErrorResponse("fileId is required", 400), nil
-	}
-
-	// Delete the object from S3
-	_, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(fileID),
-	})
-	if err != nil {
-		log.Printf("Failed to delete object from S3: %v", err)
-		return createErrorResponse(fmt.Sprintf("Failed to delete file: %v", err), 500), nil
-	}
-
-	// Return success message
-	resBody := MessageResponseBody{
-		Message: "Archivo eliminado exitosamente",
 	}
 
 	bodyBytes, err := json.Marshal(resBody)
