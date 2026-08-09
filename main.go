@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -59,43 +60,45 @@ type MessageResponseBody struct {
 	Message string `json:"message"`
 }
 
+// corsHeaders returns the standard CORS headers for all responses
+func corsHeaders() map[string]string {
+	return map[string]string{
+		"Access-Control-Allow-Origin": "*",
+		"Content-Type":                "application/json",
+	}
+}
+
 // Handler is the entry point for the Lambda function.
-// Compatible with API Gateway v1 and v2 payloads.
-// Routes based on the HTTP method:
-//   - POST   → Upload flow
-//   - GET    → Download flow (Burn After Reading)
-//   - DELETE → Delete file physically from S3
-func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+// Uses API Gateway HTTP API v2 event types.
+func Handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
 	bucketName := os.Getenv("BUCKET_NAME")
 	if bucketName == "" {
 		log.Println("BUCKET_NAME environment variable is not set")
 		return createErrorResponse("Internal server error configuration", 500), nil
 	}
 
-	// Detect HTTP method — compatible with API Gateway v1 and v2 payloads
-	method := req.HTTPMethod
-	if method == "" {
-		method = req.RequestContext.HTTPMethod
-	}
+	// Extract HTTP method from v2 request context
+	method := strings.ToUpper(req.RequestContext.HTTP.Method)
 
 	// Extract fileId path parameter
-	fileID, hasFileID := req.PathParameters["fileId"]
+	fileID := req.PathParameters["fileId"]
 
-	switch {
-	case method == "POST":
+	switch method {
+	case "POST":
 		return handleUpload(ctx, bucketName)
-	case method == "GET" && hasFileID && fileID != "":
+	case "GET":
 		return handleDownload(ctx, fileID, bucketName)
-	case method == "DELETE" && hasFileID && fileID != "":
+	case "DELETE":
 		return handleDeleteFile(ctx, fileID, bucketName)
+	case "OPTIONS":
+		return handleOptions()
 	default:
 		return createErrorResponse("Method not allowed", 405), nil
 	}
 }
 
 // handleUpload generates a presigned PUT URL and stores metadata in DynamoDB.
-// Uses UUID v4 as the fileId.
-func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayProxyResponse, error) {
+func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayV2HTTPResponse, error) {
 	now := time.Now()
 
 	// Generate a unique fileId using UUID v4
@@ -141,22 +144,24 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayProx
 		return createErrorResponse("Failed to encode response", 500), nil
 	}
 
-	return events.APIGatewayProxyResponse{
+	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers: map[string]string{
-			"Access-Control-Allow-Origin": "*",
-			"Content-Type":                "application/json",
-		},
-		Body: string(bodyBytes),
+		Headers:    corsHeaders(),
+		Body:       string(bodyBytes),
 	}, nil
 }
 
 // handleDownload implements the Burn After Reading pattern:
-// 1. Attempts a conditional DeleteItem (attribute_exists(fileId)) to atomically verify and destroy the record
-// 2. If the delete fails (record doesn't exist), returns 404
-// 3. Only on successful delete, generates a presigned GET URL with 2-minute expiration
-func handleDownload(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
-	// Attempt conditional delete — this atomically checks existence and removes the record
+// 1. Validates fileId is present
+// 2. Attempts a conditional DeleteItem to atomically verify and destroy the record
+// 3. If the delete fails, returns 404
+// 4. On success, generates a presigned GET URL with 2-minute expiration
+func handleDownload(ctx context.Context, fileID string, bucketName string) (events.APIGatewayV2HTTPResponse, error) {
+	if fileID == "" {
+		return createErrorResponse("fileId is required", 400), nil
+	}
+
+	// Attempt conditional delete — atomically checks existence and removes the record
 	_, err := dynamodbClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName),
 		Key: map[string]types.AttributeValue{
@@ -165,7 +170,6 @@ func handleDownload(ctx context.Context, fileID string, bucketName string) (even
 		ConditionExpression: aws.String("attribute_exists(fileId)"),
 	})
 	if err != nil {
-		// ConditionalCheckFailedException means the item didn't exist (already burned or expired)
 		log.Printf("DeleteItem failed for fileId %s: %v", fileID, err)
 		return createErrorResponse("El enlace ha caducado o ya fue utilizado", 404), nil
 	}
@@ -193,18 +197,19 @@ func handleDownload(ctx context.Context, fileID string, bucketName string) (even
 		return createErrorResponse("Failed to encode response", 500), nil
 	}
 
-	return events.APIGatewayProxyResponse{
+	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers: map[string]string{
-			"Access-Control-Allow-Origin": "*",
-			"Content-Type":                "application/json",
-		},
-		Body: string(bodyBytes),
+		Headers:    corsHeaders(),
+		Body:       string(bodyBytes),
 	}, nil
 }
 
 // handleDeleteFile physically deletes the S3 object
-func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (events.APIGatewayProxyResponse, error) {
+func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (events.APIGatewayV2HTTPResponse, error) {
+	if fileID == "" {
+		return createErrorResponse("fileId is required", 400), nil
+	}
+
 	// Delete the object from S3
 	_, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(bucketName),
@@ -226,28 +231,37 @@ func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (ev
 		return createErrorResponse("Failed to encode response", 500), nil
 	}
 
-	return events.APIGatewayProxyResponse{
+	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers: map[string]string{
-			"Access-Control-Allow-Origin": "*",
-			"Content-Type":                "application/json",
-		},
-		Body: string(bodyBytes),
+		Headers:    corsHeaders(),
+		Body:       string(bodyBytes),
+	}, nil
+}
+
+// handleOptions responds to CORS preflight requests
+func handleOptions() (events.APIGatewayV2HTTPResponse, error) {
+	resBody := MessageResponseBody{
+		Message: "CORS OK",
+	}
+
+	bodyBytes, _ := json.Marshal(resBody)
+
+	return events.APIGatewayV2HTTPResponse{
+		StatusCode: 200,
+		Headers:    corsHeaders(),
+		Body:       string(bodyBytes),
 	}, nil
 }
 
 // createErrorResponse is a helper to format HTTP error responses
-func createErrorResponse(message string, statusCode int) events.APIGatewayProxyResponse {
+func createErrorResponse(message string, statusCode int) events.APIGatewayV2HTTPResponse {
 	errBody := ErrorResponseBody{Error: message}
 	bodyBytes, _ := json.Marshal(errBody)
 
-	return events.APIGatewayProxyResponse{
+	return events.APIGatewayV2HTTPResponse{
 		StatusCode: statusCode,
-		Headers: map[string]string{
-			"Access-Control-Allow-Origin": "*",
-			"Content-Type":                "application/json",
-		},
-		Body: string(bodyBytes),
+		Headers:    corsHeaders(),
+		Body:       string(bodyBytes),
 	}
 }
 
