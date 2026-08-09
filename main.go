@@ -60,11 +60,34 @@ type MessageResponseBody struct {
 	Message string `json:"message"`
 }
 
-// corsHeaders returns the standard CORS headers for all responses
-func corsHeaders() map[string]string {
+// allowedOrigins defines the origins permitted by CORS
+var allowedOrigins = map[string]bool{
+	"http://localhost:4200":                  true,
+	"https://d22t48dvplkw3p.cloudfront.net": true,
+}
+
+// defaultOrigin is returned when the request origin is not in the allowed list
+const defaultOrigin = "https://d22t48dvplkw3p.cloudfront.net"
+
+// getAllowedOrigin inspects the request headers and returns the appropriate CORS origin
+func getAllowedOrigin(headers map[string]string) string {
+	origin := headers["origin"]
+	if origin == "" {
+		origin = headers["Origin"]
+	}
+	if allowedOrigins[origin] {
+		return origin
+	}
+	return defaultOrigin
+}
+
+// corsHeaders returns the CORS headers based on the resolved origin
+func corsHeaders(origin string) map[string]string {
 	return map[string]string{
-		"Access-Control-Allow-Origin": "*",
-		"Content-Type":                "application/json",
+		"Access-Control-Allow-Origin":  origin,
+		"Access-Control-Allow-Headers": "Content-Type, Authorization",
+		"Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+		"Content-Type":                 "application/json",
 	}
 }
 
@@ -74,8 +97,11 @@ func Handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 	bucketName := os.Getenv("BUCKET_NAME")
 	if bucketName == "" {
 		log.Println("BUCKET_NAME environment variable is not set")
-		return createErrorResponse("Internal server error configuration", 500), nil
+		return createErrorResponse("Internal server error configuration", 500, getAllowedOrigin(req.Headers)), nil
 	}
+
+	// Resolve the allowed CORS origin for this request
+	origin := getAllowedOrigin(req.Headers)
 
 	// Extract HTTP method from v2 request context
 	method := strings.ToUpper(req.RequestContext.HTTP.Method)
@@ -85,20 +111,20 @@ func Handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 
 	switch method {
 	case "POST":
-		return handleUpload(ctx, bucketName)
+		return handleUpload(ctx, bucketName, origin)
 	case "GET":
-		return handleDownload(ctx, fileID, bucketName)
+		return handleDownload(ctx, fileID, bucketName, origin)
 	case "DELETE":
-		return handleDeleteFile(ctx, fileID, bucketName)
+		return handleDeleteFile(ctx, fileID, bucketName, origin)
 	case "OPTIONS":
-		return handleOptions()
+		return handleOptions(origin)
 	default:
-		return createErrorResponse("Method not allowed", 405), nil
+		return createErrorResponse("Method not allowed", 405, origin), nil
 	}
 }
 
 // handleUpload generates a presigned PUT URL and stores metadata in DynamoDB.
-func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayV2HTTPResponse, error) {
+func handleUpload(ctx context.Context, bucketName string, origin string) (events.APIGatewayV2HTTPResponse, error) {
 	now := time.Now()
 
 	// Generate a unique fileId using UUID v4
@@ -117,7 +143,7 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayV2HT
 	})
 	if err != nil {
 		log.Printf("Failed to put item in DynamoDB: %v", err)
-		return createErrorResponse(fmt.Sprintf("Failed to save metadata: %v", err), 500), nil
+		return createErrorResponse(fmt.Sprintf("Failed to save metadata: %v", err), 500, origin), nil
 	}
 
 	// Generate an S3 Pre-signed URL of type PUT lasting 15 minutes
@@ -129,7 +155,7 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayV2HT
 	})
 	if err != nil {
 		log.Printf("Failed to generate pre-signed URL: %v", err)
-		return createErrorResponse(fmt.Sprintf("Failed to generate upload URL: %v", err), 500), nil
+		return createErrorResponse(fmt.Sprintf("Failed to generate upload URL: %v", err), 500, origin), nil
 	}
 
 	// Respond with uploadUrl and fileId
@@ -141,12 +167,12 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayV2HT
 	bodyBytes, err := json.Marshal(resBody)
 	if err != nil {
 		log.Printf("Failed to marshal response body: %v", err)
-		return createErrorResponse("Failed to encode response", 500), nil
+		return createErrorResponse("Failed to encode response", 500, origin), nil
 	}
 
 	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers:    corsHeaders(),
+		Headers:    corsHeaders(origin),
 		Body:       string(bodyBytes),
 	}, nil
 }
@@ -156,9 +182,9 @@ func handleUpload(ctx context.Context, bucketName string) (events.APIGatewayV2HT
 // 2. Attempts a conditional DeleteItem to atomically verify and destroy the record
 // 3. If the delete fails, returns 404
 // 4. On success, generates a presigned GET URL with 2-minute expiration
-func handleDownload(ctx context.Context, fileID string, bucketName string) (events.APIGatewayV2HTTPResponse, error) {
+func handleDownload(ctx context.Context, fileID string, bucketName string, origin string) (events.APIGatewayV2HTTPResponse, error) {
 	if fileID == "" {
-		return createErrorResponse("fileId is required", 400), nil
+		return createErrorResponse("fileId is required", 400, origin), nil
 	}
 
 	// Attempt conditional delete — atomically checks existence and removes the record
@@ -171,7 +197,7 @@ func handleDownload(ctx context.Context, fileID string, bucketName string) (even
 	})
 	if err != nil {
 		log.Printf("DeleteItem failed for fileId %s: %v", fileID, err)
-		return createErrorResponse("El enlace ha caducado o ya fue utilizado", 404), nil
+		return createErrorResponse("El enlace ha caducado o ya fue utilizado", 404, origin), nil
 	}
 
 	// Record successfully deleted — generate a presigned GET URL with 2-minute expiration
@@ -183,7 +209,7 @@ func handleDownload(ctx context.Context, fileID string, bucketName string) (even
 	})
 	if err != nil {
 		log.Printf("Failed to generate presigned GET URL: %v", err)
-		return createErrorResponse("Failed to generate download URL", 500), nil
+		return createErrorResponse("Failed to generate download URL", 500, origin), nil
 	}
 
 	// Return the download URL
@@ -194,20 +220,20 @@ func handleDownload(ctx context.Context, fileID string, bucketName string) (even
 	bodyBytes, err := json.Marshal(resBody)
 	if err != nil {
 		log.Printf("Failed to marshal response body: %v", err)
-		return createErrorResponse("Failed to encode response", 500), nil
+		return createErrorResponse("Failed to encode response", 500, origin), nil
 	}
 
 	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers:    corsHeaders(),
+		Headers:    corsHeaders(origin),
 		Body:       string(bodyBytes),
 	}, nil
 }
 
 // handleDeleteFile physically deletes the S3 object
-func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (events.APIGatewayV2HTTPResponse, error) {
+func handleDeleteFile(ctx context.Context, fileID string, bucketName string, origin string) (events.APIGatewayV2HTTPResponse, error) {
 	if fileID == "" {
-		return createErrorResponse("fileId is required", 400), nil
+		return createErrorResponse("fileId is required", 400, origin), nil
 	}
 
 	// Delete the object from S3
@@ -217,7 +243,7 @@ func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (ev
 	})
 	if err != nil {
 		log.Printf("Failed to delete object from S3: %v", err)
-		return createErrorResponse(fmt.Sprintf("Failed to delete file: %v", err), 500), nil
+		return createErrorResponse(fmt.Sprintf("Failed to delete file: %v", err), 500, origin), nil
 	}
 
 	// Return success message
@@ -228,18 +254,18 @@ func handleDeleteFile(ctx context.Context, fileID string, bucketName string) (ev
 	bodyBytes, err := json.Marshal(resBody)
 	if err != nil {
 		log.Printf("Failed to marshal response body: %v", err)
-		return createErrorResponse("Failed to encode response", 500), nil
+		return createErrorResponse("Failed to encode response", 500, origin), nil
 	}
 
 	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers:    corsHeaders(),
+		Headers:    corsHeaders(origin),
 		Body:       string(bodyBytes),
 	}, nil
 }
 
 // handleOptions responds to CORS preflight requests
-func handleOptions() (events.APIGatewayV2HTTPResponse, error) {
+func handleOptions(origin string) (events.APIGatewayV2HTTPResponse, error) {
 	resBody := MessageResponseBody{
 		Message: "CORS OK",
 	}
@@ -248,19 +274,19 @@ func handleOptions() (events.APIGatewayV2HTTPResponse, error) {
 
 	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
-		Headers:    corsHeaders(),
+		Headers:    corsHeaders(origin),
 		Body:       string(bodyBytes),
 	}, nil
 }
 
 // createErrorResponse is a helper to format HTTP error responses
-func createErrorResponse(message string, statusCode int) events.APIGatewayV2HTTPResponse {
+func createErrorResponse(message string, statusCode int, origin string) events.APIGatewayV2HTTPResponse {
 	errBody := ErrorResponseBody{Error: message}
 	bodyBytes, _ := json.Marshal(errBody)
 
 	return events.APIGatewayV2HTTPResponse{
 		StatusCode: statusCode,
-		Headers:    corsHeaders(),
+		Headers:    corsHeaders(origin),
 		Body:       string(bodyBytes),
 	}
 }
